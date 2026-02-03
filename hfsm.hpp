@@ -1,54 +1,80 @@
+#pragma once
+
 #include <algorithm>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
+
+// 利用側が定義するイベント型
+enum class Event : unsigned;
+
+namespace hfsm {
+
+using ::Event;
 
 template <class T>
 struct Singleton {
-  static T* getInstance() {
+  static T *getInstance() {
     static T instance;
     return &instance;
   }
 };
 
-enum class Event : unsigned;
-
 template <class ContextType>
 struct State {
-  State() : parent{nullptr} {}
-  virtual void onEntry(ContextType& context, const Event& event) = 0;
-  virtual void perform(ContextType& context, const Event& event) = 0;
-  virtual void onExit(ContextType& context, const Event& event) = 0;
+  virtual ~State() = default;
+  virtual void onEntry(ContextType &context, const Event &event) = 0;
+  virtual void perform(ContextType &context, const Event &event) = 0;
+  virtual void onExit(ContextType &context, const Event &event) = 0;
   virtual bool isComposite() { return false; }
-
-  State<ContextType>* parent;
 };
 
 template <class ContextType>
 using Transition =
-    std::vector<std::tuple<State<ContextType>*, Event, State<ContextType>*>>;
+    std::vector<std::tuple<State<ContextType> *, Event, State<ContextType> *>>;
+
+template <class ContextType>
+struct ParentLinker {
+  static std::unordered_map<State<ContextType> *, State<ContextType> *> table;
+};
+
+template <class ContextType>
+std::unordered_map<State<ContextType> *, State<ContextType> *>
+    ParentLinker<ContextType>::table{};
 
 template <class ContextType>
 struct Resolver {
   Transition<ContextType> transition;
 
-  void set(State<ContextType>* parent, Transition<ContextType> transition) {
-    this->transition = transition;
-    for (auto&& tran : this->transition) {
-      State<ContextType>* state = std::get<0>(tran);
-      state->parent = parent;
+  void set(State<ContextType> *parent,
+           const Transition<ContextType> &transitionInput) {
+    transition = transitionInput;
+    for (auto &&tran : transition) {
+      State<ContextType> *from = std::get<0>(tran);
+      State<ContextType> *to = std::get<2>(tran);
+      ParentLinker<ContextType>::table.emplace(from, parent);
+      ParentLinker<ContextType>::table.emplace(to, parent);
     }
   }
 
-  State<ContextType>* resolveFirst() {
-    if (transition.size() == 0) return nullptr;
+  void add(State<ContextType> *parent, State<ContextType> *from,
+           const Event &event, State<ContextType> *to) {
+    ParentLinker<ContextType>::table.emplace(from, parent);
+    ParentLinker<ContextType>::table.emplace(to, parent);
+    transition.emplace_back(from, event, to);
+  }
+
+  State<ContextType> *resolveFirst() const {
+    if (transition.empty())
+      return nullptr;
     return std::get<0>(transition[0]);
   }
 
-  State<ContextType>* resolve(State<ContextType>* currState,
-                              const Event& receivedEvent) {
-    for (auto&& tran : transition) {
-      auto&& state = std::get<0>(tran);
-      auto&& event = std::get<1>(tran);
+  State<ContextType> *resolve(State<ContextType> *currState,
+                              const Event &receivedEvent) const {
+    for (auto &&tran : transition) {
+      auto &&state = std::get<0>(tran);
+      auto &&event = std::get<1>(tran);
       if (state == currState && event == receivedEvent) {
         return std::get<2>(tran);
       }
@@ -60,95 +86,125 @@ struct Resolver {
 template <class ContextType>
 struct CompositeState : State<ContextType> {
   Resolver<ContextType> resolver;
+  State<ContextType> *initialState;
 
-  void set(Transition<ContextType> transition) {
-    this->resolver.set(this, transition);
+  CompositeState() : initialState{nullptr} {}
+
+  void set(State<ContextType> *initial,
+           const Transition<ContextType> &transitionInput) {
+    initialState = initial;
+    resolver.set(this, transitionInput);
   }
 
-  State<ContextType>* resolveFirst() { return resolver.resolveFirst(); }
+  void set(State<ContextType> *initial,
+           std::initializer_list<
+               std::tuple<State<ContextType> *, Event, State<ContextType> *>>
+               transitionInput) {
+    set(initial, Transition<ContextType>(transitionInput));
+  }
 
-  State<ContextType>* resolve(State<ContextType>* currState,
-                              const Event& event) {
+  CompositeState &setInitial(State<ContextType> *initial) {
+    initialState = initial;
+    return *this;
+  }
+
+  CompositeState &addTransition(State<ContextType> *from, const Event &event,
+                                State<ContextType> *to) {
+    resolver.add(this, from, event, to);
+    if (!initialState) {
+      initialState = from;
+    }
+    return *this;
+  }
+
+  State<ContextType> *resolveFirst() const {
+    if (initialState)
+      return initialState;
+    return resolver.resolveFirst();
+  }
+
+  State<ContextType> *resolve(State<ContextType> *currState,
+                              const Event &event) const {
     return resolver.resolve(currState, event);
   }
 
-  virtual bool isComposite() { return true; }
+  bool isComposite() override { return true; }
 };
 
 template <class ContextType, class InitialState>
 struct StateMachine {
   struct Root : CompositeState<ContextType>, Singleton<Root> {
-    virtual void onEntry(ContextType& context, const Event& event) {}
-    virtual void perform(ContextType& context, const Event& event) {}
-    virtual void onExit(ContextType& context, const Event& event) {}
+    void onEntry(ContextType &, const Event &) override {}
+    void perform(ContextType &, const Event &) override {}
+    void onExit(ContextType &, const Event &) override {}
   };
+
+  struct Instance {
+    State<ContextType> *prevState;
+    State<ContextType> *currState;
+    ContextType context;
+  };
+
   Root root;
-  State<ContextType>* prevState;
-  State<ContextType>* currState;
-  ContextType context;
 
-  StateMachine(Transition<ContextType> transition) {
-    root.set(transition);
-    prevState = nullptr;
-    currState = InitialState::getInstance();
+  explicit StateMachine(const Transition<ContextType> &transition) {
+    root.set(InitialState::getInstance(), transition);
   }
 
-  void setState(State<ContextType>* nextState) {
-    if (nextState && nextState != currState) {
-      prevState = currState;
-      currState = nextState;
-    }
-  }
-
-  State<ContextType>* resolve(const Event& event) {
-    if (!currState->parent) {
+  State<ContextType> *parentOf(State<ContextType> *state) const {
+    auto &table = ParentLinker<ContextType>::table;
+    auto it = table.find(state);
+    if (it == table.end())
       return nullptr;
-    }
-    CompositeState<ContextType>* prevParent = nullptr;
-    CompositeState<ContextType>* parent =
-        static_cast<CompositeState<ContextType>*>(currState->parent);
-    State<ContextType>* nextState = parent->resolve(currState, event);
-    if (nextState && !nextState->isComposite()) return nextState;
+    return it->second;
+  }
 
-    while (!nextState && parent->parent) {
-      prevParent = parent;
-      parent = static_cast<CompositeState<ContextType>*>(parent->parent);
-      nextState = parent->resolve(prevParent, event);
+  State<ContextType> *resolve(State<ContextType> *currState,
+                              const Event &event) const {
+    if (!currState)
+      return nullptr;
+    State<ContextType> *parent = parentOf(currState);
+    State<ContextType> *nextState = nullptr;
+    while (parent) {
+      auto *compositeParent =
+          static_cast<CompositeState<ContextType> *>(parent);
+      nextState = compositeParent->resolve(currState, event);
+      if (nextState)
+        break;
+      currState = compositeParent;
+      parent = parentOf(compositeParent);
     }
 
     while (nextState && nextState->isComposite()) {
-      CompositeState<ContextType>* state =
-          static_cast<CompositeState<ContextType>*>(nextState);
-      nextState = state->resolveFirst();
+      auto *composite = static_cast<CompositeState<ContextType> *>(nextState);
+      nextState = composite->resolveFirst();
     }
-
     return nextState;
   }
 
-  void doAction(const Event& event) {
-    if (currState == prevState) return;
-
-    State<ContextType>* prevParent = prevState ? prevState->parent : nullptr;
-    State<ContextType>* currParent = currState->parent;
-
-    std::vector<State<ContextType>*> prevParents;
-    std::vector<State<ContextType>*> currParents;
-    while (prevParent) {
-      prevParents.push_back(prevParent);
-      prevParent = prevParent->parent;
+  std::vector<State<ContextType> *>
+  parentChain(State<ContextType> *state) const {
+    std::vector<State<ContextType> *> chain;
+    State<ContextType> *parent = parentOf(state);
+    while (parent) {
+      chain.push_back(parent);
+      parent = parentOf(parent);
     }
-    while (currParent) {
-      currParents.push_back(currParent);
-      currParent = currParent->parent;
-    }
+    std::reverse(chain.begin(), chain.end());
+    return chain;
+  }
 
-    std::reverse(prevParents.begin(), prevParents.end());
-    std::reverse(currParents.begin(), currParents.end());
+  void doAction(Instance &instance, const Event &event) const {
+    if (instance.currState == instance.prevState)
+      return;
 
-    std::vector<State<ContextType>*> exitList;
-    std::vector<State<ContextType>*> entryList;
-    int len = std::min(prevParents.size(), currParents.size());
-    for (int i = 0; i < len; ++i) {
+    auto prevParents = parentChain(instance.prevState);
+    auto currParents = parentChain(instance.currState);
+
+    std::vector<State<ContextType> *> exitList;
+    std::vector<State<ContextType> *> entryList;
+    size_t len = std::min(prevParents.size(), currParents.size());
+    for (size_t i = 0; i < len; ++i) {
       if (prevParents[i] != currParents[i]) {
         exitList.push_back(prevParents[i]);
         entryList.push_back(currParents[i]);
@@ -156,13 +212,13 @@ struct StateMachine {
     }
 
     if (prevParents.size() < currParents.size()) {
-      for (int i = prevParents.size(); i < currParents.size(); ++i) {
+      for (size_t i = prevParents.size(); i < currParents.size(); ++i) {
         entryList.push_back(currParents[i]);
       }
     }
 
     if (prevParents.size() > currParents.size()) {
-      for (int i = currParents.size(); i < prevParents.size(); ++i) {
+      for (size_t i = currParents.size(); i < prevParents.size(); ++i) {
         exitList.push_back(prevParents[i]);
       }
     }
@@ -170,27 +226,43 @@ struct StateMachine {
     std::reverse(exitList.begin(), exitList.end());
 
     // onExit
-    if (prevState) prevState->onExit(context, event);
-    for (auto&& elm : exitList) {
-      elm->onExit(context, event);
+    if (instance.prevState)
+      instance.prevState->onExit(instance.context, event);
+    for (auto &&elm : exitList) {
+      elm->onExit(instance.context, event);
     }
 
     // onEntry
-    for (auto&& elm : entryList) {
-      elm->onEntry(context, event);
+    for (auto &&elm : entryList) {
+      elm->onEntry(instance.context, event);
     }
-    currState->onEntry(context, event);
+    instance.currState->onEntry(instance.context, event);
 
     // Perform
-    currState->perform(context, event);
+    instance.currState->perform(instance.context, event);
   }
 
-  bool dispatch(const Event& event) {
-    State<ContextType>* nextState = resolve(event);
+  bool dispatch(Instance &instance, const Event &event) const {
+    State<ContextType> *nextState = resolve(instance.currState, event);
     if (!nextState)
       return false;
-    setState(nextState);
-    doAction(event);
+    if (nextState == instance.currState) {
+      instance.prevState = instance.currState;
+      instance.currState->perform(instance.context, event);
+      return true;
+    }
+    instance.prevState = instance.currState;
+    instance.currState = nextState;
+    doAction(instance, event);
     return true;
   }
+
+  Instance makeInstance() const {
+    Instance inst{};
+    inst.prevState = nullptr;
+    inst.currState = InitialState::getInstance();
+    return inst;
+  }
 };
+
+} // namespace hfsm
